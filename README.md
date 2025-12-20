@@ -1,5 +1,4 @@
 # Fireline (Verizon Frontline App Developer Challenge)
-A mission-aware, offline-first coordination app that keeps first responders located, connected, and alerted using edge computing when networks degrade. 
 Fireline is an edge-first, offline-tolerant incident connectivity concept designed to help first responders stay coordinated during critical deployments (e.g., wildfires, EMS incidents, disaster response) when cellular coverage is degraded, networks are congested, or cloud connectivity is unavailable.
 
 ## Problem
