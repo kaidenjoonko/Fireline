@@ -28,6 +28,8 @@ const app = express();
 
     lastLocationByResponder:
     responderId -> { lat, lng, accuracy?, at }
+
+    //incidentId -> (responderId => SosState)
 */
 const rooms = new Map<string, Set<WebSocket>>();
 const clientMeta = new Map<WebSocket, { incidentId: string; responderId: string }>();
@@ -38,8 +40,14 @@ type Location = {
     accuracy?: number;
     at: number; // server timestamp (ms)
 };
-
 const lastLocationByResponder = new Map<string, Location>();
+
+type SosState = {
+    note?: string;
+    at: number; // server timestamp when SOS was raised
+}
+const activeSosByIncident = new Map<string, Map<string, SosState>>();
+
 
 /* =========================
     Helpers
@@ -118,6 +126,20 @@ function getIncidentLocations(incidentId: string): Record<string, Location> {
     return locations;
 }
 
+/**
+ * Gather active SOS states for responders currently in an incident.
+ */
+function getIncidentSos(incidentId: string): Record<string, SosState> {
+    const incidentSos = activeSosByIncident.get(incidentId);
+    if (!incidentSos) return {};
+
+    const out: Record<string, SosState> = {};
+    for (const [responderId, sos] of incidentSos.entries()) {
+        out[responderId] = sos;
+    }
+    return out;
+}
+
 /* =========================
     HTTP Endpoints
     ========================= */
@@ -179,20 +201,20 @@ wss.on("connection", (ws) => {
         })
         );
 
-        // Send incident snapshot (presence + last-known locations)
+        // Send incident snapshot (presence + last-known locations + sos)
         const responders = getIncidentResponderIds(incidentId);
         const locations = getIncidentLocations(incidentId);
-
+        const sos = getIncidentSos(incidentId);
+        
         ws.send(
-        JSON.stringify({
+          JSON.stringify({
             type: "INCIDENT_SNAPSHOT",
             incidentId,
             responders,
             locations,
-        })
+            sos,
+          })
         );
-
-        return;
     }
 
     // Must have joined an incident before sending any other messages
@@ -240,6 +262,57 @@ wss.on("connection", (ws) => {
         ...location,
         });
 
+        return;
+    }
+
+    /* ---- SOS Updates ----
+        Clients send SOS state; server stores and broadcasts.
+    */
+    if (msg.type === "SOS_RAISE") {
+        const note = typeof msg.note === "string" ? msg.note : undefined;
+        
+        if (!activeSosByIncident.has(meta.incidentId)) {
+            activeSosByIncident.set(meta.incidentId, new Map());
+        }
+        
+        const incidentSos = activeSosByIncident.get(meta.incidentId)!;
+        
+        // exactOptionalPropertyTypes-safe: only include note if defined
+        const sosState: SosState = {
+            at: Date.now(),
+            ...(note ? { note } : {}),
+        };
+        
+        // Store as active SOS for this responder in this incident
+        incidentSos.set(meta.responderId, sosState);
+        
+        // Broadcast to the incident room immediately
+        broadcastToIncident(meta.incidentId, {
+            type: "SOS_RAISE",
+            incidentId: meta.incidentId,
+            responderId: meta.responderId,
+            ...sosState,
+        });
+        
+        return;
+    }
+    
+    if (msg.type === "SOS_CLEAR") {
+        const incidentSos = activeSosByIncident.get(meta.incidentId);
+        incidentSos?.delete(meta.responderId);
+      
+        // Cleanup empty incident SOS map
+        if (incidentSos && incidentSos.size === 0) {
+          activeSosByIncident.delete(meta.incidentId);
+        }
+      
+        broadcastToIncident(meta.incidentId, {
+          type: "SOS_CLEAR",
+          incidentId: meta.incidentId,
+          responderId: meta.responderId,
+          at: Date.now(),
+        });
+      
         return;
     }
 
