@@ -1,6 +1,7 @@
 /* =====================================================
 Fireline Edge Server
-- Local incident coordination (HTTP + WebSocket)
+    - Local incident coordination (HTTP + WebSocket)
+    - Reliability: msgId + ACK + dedup (TTL)
 ===================================================== */
 
 console.log("Fireline edge server starting...");
@@ -18,22 +19,9 @@ import WebSocket = require("ws");
 const app = express();
 
 /* =========================
-    Fireline In-Memory State
-    =========================
-    rooms:
-    incidentId -> set of active WebSocket connections
-
-    clientMeta:
-    socket -> { incidentId, responderId }
-
-    lastLocationByResponder:
-    responderId -> { lat, lng, accuracy?, at }
-
-    activeSosByIncident:
-    incidentId -> (responderId -> SosState)
-*/
-const rooms = new Map<string, Set<WebSocket>>();
-const clientMeta = new Map<WebSocket, { incidentId: string; responderId: string }>();
+    Types
+    ========================= */
+type ClientMeta = { incidentId: string; responderId: string };
 
 type Location = {
     lat: number;
@@ -42,23 +30,26 @@ type Location = {
     at: number; // server timestamp (ms)
 };
 
-const lastLocationByResponder = new Map<string, Location>();
-
 type SosState = {
     note?: string;
     at: number; // server timestamp when SOS was raised
 };
 
+/* =========================
+    Fireline In-Memory State
+    ========================= */
+const rooms = new Map<string, Set<WebSocket>>();
+const clientMeta = new Map<WebSocket, ClientMeta>();
+
+const lastLocationByResponder = new Map<string, Location>();
 const activeSosByIncident = new Map<string, Map<string, SosState>>();
+
+const dedupMsgIdsByIncident = new Map<string, Map<string, number>>();
+const DEDUP_TTL_MS = 15 * 60 * 1000; // 15 minutes
 
 /* =========================
     Helpers
     ========================= */
-
-/**
-* Safely parse incoming WebSocket data as JSON.
-* Prevents malformed messages from crashing the server.
-*/
 function safeJsonParse(raw: WebSocket.RawData): any | null {
     try {
     return JSON.parse(raw.toString());
@@ -67,39 +58,61 @@ function safeJsonParse(raw: WebSocket.RawData): any | null {
     }
 }
 
-/**
-* Broadcast a payload to all clients in an incident room.
-*/
+function send(ws: WebSocket, payload: unknown) {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify(payload));
+}
+
+function error(ws: WebSocket, message: string) {
+    send(ws, { type: "ERROR", error: message, at: Date.now() });
+}
+
+function ack(ws: WebSocket, msgId: string) {
+    send(ws, { type: "ACK_MSG", msgId, at: Date.now() });
+}
+
 function broadcastToIncident(incidentId: string, payload: unknown) {
     const clients = rooms.get(incidentId);
     if (!clients) return;
 
     const msg = JSON.stringify(payload);
     for (const client of clients) {
-    if (client.readyState === WebSocket.OPEN) {
-        client.send(msg);
-    }
+    if (client.readyState === WebSocket.OPEN) client.send(msg);
     }
 }
 
-/**
-* Get the list of responder IDs currently in an incident room.
-*/
 function getIncidentResponderIds(incidentId: string): string[] {
     const clients = rooms.get(incidentId);
     if (!clients) return [];
 
-    const responderIds: string[] = [];
+    const ids: string[] = [];
     for (const client of clients) {
     const meta = clientMeta.get(client);
-    if (meta) responderIds.push(meta.responderId);
+    if (meta) ids.push(meta.responderId);
     }
-    return responderIds;
+    return ids;
 }
 
-/**
-* Validate latitude/longitude.
-*/
+function getIncidentLocations(incidentId: string): Record<string, Location> {
+    const responderIds = getIncidentResponderIds(incidentId);
+    const locations: Record<string, Location> = {};
+
+    for (const id of responderIds) {
+    const loc = lastLocationByResponder.get(id);
+    if (loc) locations[id] = loc;
+    }
+    return locations;
+}
+
+function getIncidentSos(incidentId: string): Record<string, SosState> {
+    const incidentSos = activeSosByIncident.get(incidentId);
+    if (!incidentSos) return {};
+
+    const out: Record<string, SosState> = {};
+    for (const [responderId, sos] of incidentSos.entries()) out[responderId] = sos;
+    return out;
+}
+
 function isValidLatLng(lat: unknown, lng: unknown): lat is number {
     return (
     typeof lat === "number" &&
@@ -113,33 +126,30 @@ function isValidLatLng(lat: unknown, lng: unknown): lat is number {
     );
 }
 
-/**
-* Gather last-known locations for responders currently in an incident.
-*/
-function getIncidentLocations(incidentId: string): Record<string, Location> {
-    const responderIds = getIncidentResponderIds(incidentId);
-
-    const locations: Record<string, Location> = {};
-    for (const id of responderIds) {
-    const loc = lastLocationByResponder.get(id);
-    if (loc) locations[id] = loc;
+function getIncidentDedupMap(incidentId: string): Map<string, number> {
+    if (!dedupMsgIdsByIncident.has(incidentId)) {
+    dedupMsgIdsByIncident.set(incidentId, new Map());
     }
-    return locations;
+    return dedupMsgIdsByIncident.get(incidentId)!;
 }
 
-/**
-* Gather active SOS states for responders currently in an incident.
-*/
-function getIncidentSos(incidentId: string): Record<string, SosState> {
-    const incidentSos = activeSosByIncident.get(incidentId);
-    if (!incidentSos) return {};
-
-    const out: Record<string, SosState> = {};
-    for (const [responderId, sos] of incidentSos.entries()) {
-    out[responderId] = sos;
-    }
-    return out;
+function markMsgIdIfNew(incidentId: string, msgId: string): boolean {
+    const map = getIncidentDedupMap(incidentId);
+    if (map.has(msgId)) return false;
+    map.set(msgId, Date.now());
+    return true;
 }
+
+/* TTL cleanup for dedup store */
+setInterval(() => {
+    const now = Date.now();
+    for (const [incidentId, map] of dedupMsgIdsByIncident.entries()) {
+    for (const [msgId, firstSeenAt] of map.entries()) {
+        if (now - firstSeenAt > DEDUP_TTL_MS) map.delete(msgId);
+    }
+    if (map.size === 0) dedupMsgIdsByIncident.delete(incidentId);
+    }
+}, 60 * 1000);
 
 /* =========================
     HTTP Endpoints
@@ -154,7 +164,7 @@ app.get("/health", (_req, res) => {
 const server = http.createServer(app);
 
 /* =========================
-    WebSocket Server (Realtime)
+    WebSocket Server
     ========================= */
 const wss = new WebSocket.Server({ server });
 
@@ -164,22 +174,17 @@ wss.on("connection", (ws) => {
     ws.on("message", (data) => {
     const msg = safeJsonParse(data);
     if (!msg) {
-        ws.send(JSON.stringify({ type: "ERROR", error: "Invalid JSON" }));
+        error(ws, "Invalid JSON");
         return;
     }
 
-    /* ---- Handshake: Join Incident Room ---- */
+    /* ---- Handshake ---- */
     if (msg.type === "CLIENT_HELLO") {
         const incidentId = String(msg.incidentId ?? "");
         const responderId = String(msg.responderId ?? "");
 
         if (!incidentId || !responderId) {
-        ws.send(
-            JSON.stringify({
-            type: "ERROR",
-            error: "CLIENT_HELLO requires incidentId and responderId",
-            })
-        );
+        error(ws, "CLIENT_HELLO requires incidentId and responderId");
         return;
         }
 
@@ -188,47 +193,49 @@ wss.on("connection", (ws) => {
         if (!rooms.has(incidentId)) rooms.set(incidentId, new Set());
         rooms.get(incidentId)!.add(ws);
 
-        ws.send(
-        JSON.stringify({
-            type: "ACK",
-            message: "Joined incident",
-            incidentId,
-        })
-        );
+        send(ws, { type: "ACK", message: "Joined incident", incidentId, at: Date.now() });
 
-        ws.send(
-        JSON.stringify({
-            type: "INCIDENT_SNAPSHOT",
-            incidentId,
-            responders: getIncidentResponderIds(incidentId),
-            locations: getIncidentLocations(incidentId),
-            sos: getIncidentSos(incidentId),
-        })
-        );
+        send(ws, {
+        type: "INCIDENT_SNAPSHOT",
+        incidentId,
+        responders: getIncidentResponderIds(incidentId),
+        locations: getIncidentLocations(incidentId),
+        sos: getIncidentSos(incidentId),
+        at: Date.now(),
+        });
 
-        return; // IMPORTANT: stop processing this message
-    }
-
-    /* ---- Must be joined after this point ---- */
-    const meta = clientMeta.get(ws);
-    if (!meta) {
-        ws.send(
-        JSON.stringify({
-            type: "ERROR",
-            error: "Must send CLIENT_HELLO before other messages",
-        })
-        );
         return;
     }
 
-    /* ---- Location Updates ---- */
+    /* Must be joined */
+    const meta = clientMeta.get(ws);
+    if (!meta) {
+        error(ws, "Must send CLIENT_HELLO before other messages");
+        return;
+    }
+
+    /* Reliability: msgId required */
+    const msgId = msg.msgId;
+    if (typeof msgId !== "string" || msgId.trim() === "") {
+        error(ws, "Missing msgId (required for reliability)");
+        return;
+    }
+
+    /* Dedup: idempotent effect */
+    if (!markMsgIdIfNew(meta.incidentId, msgId)) {
+        ack(ws, msgId);
+        return;
+    }
+
+    /* ACK immediately on acceptance */
+    ack(ws, msgId);
+
+    /* ---- LOCATION_UPDATE ---- */
     if (msg.type === "LOCATION_UPDATE") {
-        const lat = msg.lat;
-        const lng = msg.lng;
-        const accuracy = msg.accuracy;
+        const { lat, lng, accuracy } = msg;
 
         if (!isValidLatLng(lat, lng)) {
-        ws.send(JSON.stringify({ type: "ERROR", error: "Invalid lat/lng" }));
+        error(ws, "Invalid lat/lng");
         return;
         }
 
@@ -236,15 +243,14 @@ wss.on("connection", (ws) => {
         lat,
         lng,
         at: Date.now(),
-        ...(typeof accuracy === "number" && Number.isFinite(accuracy)
-            ? { accuracy }
-            : {}),
+        ...(typeof accuracy === "number" && Number.isFinite(accuracy) ? { accuracy } : {}),
         };
 
         lastLocationByResponder.set(meta.responderId, location);
 
         broadcastToIncident(meta.incidentId, {
         type: "LOCATION_UPDATE",
+        msgId,
         incidentId: meta.incidentId,
         responderId: meta.responderId,
         ...location,
@@ -253,14 +259,11 @@ wss.on("connection", (ws) => {
         return;
     }
 
-    /* ---- SOS Updates ---- */
+    /* ---- SOS_RAISE ---- */
     if (msg.type === "SOS_RAISE") {
         const note = typeof msg.note === "string" ? msg.note : undefined;
 
-        if (!activeSosByIncident.has(meta.incidentId)) {
-        activeSosByIncident.set(meta.incidentId, new Map());
-        }
-
+        if (!activeSosByIncident.has(meta.incidentId)) activeSosByIncident.set(meta.incidentId, new Map());
         const incidentSos = activeSosByIncident.get(meta.incidentId)!;
 
         const sosState: SosState = {
@@ -272,6 +275,7 @@ wss.on("connection", (ws) => {
 
         broadcastToIncident(meta.incidentId, {
         type: "SOS_RAISE",
+        msgId,
         incidentId: meta.incidentId,
         responderId: meta.responderId,
         ...sosState,
@@ -280,16 +284,15 @@ wss.on("connection", (ws) => {
         return;
     }
 
+    /* ---- SOS_CLEAR ---- */
     if (msg.type === "SOS_CLEAR") {
         const incidentSos = activeSosByIncident.get(meta.incidentId);
         incidentSos?.delete(meta.responderId);
-
-        if (incidentSos && incidentSos.size === 0) {
-        activeSosByIncident.delete(meta.incidentId);
-        }
+        if (incidentSos && incidentSos.size === 0) activeSosByIncident.delete(meta.incidentId);
 
         broadcastToIncident(meta.incidentId, {
         type: "SOS_CLEAR",
+        msgId,
         incidentId: meta.incidentId,
         responderId: meta.responderId,
         at: Date.now(),
@@ -298,25 +301,42 @@ wss.on("connection", (ws) => {
         return;
     }
 
-    /* ---- Default: broadcast message within incident ---- */
+    /* ---- CHAT_SEND ---- */
+    if (msg.type === "CHAT_SEND") {
+        const text = String(msg.text ?? "");
+        if (!text) {
+        error(ws, "CHAT_SEND requires text");
+        return;
+        }
+
+        broadcastToIncident(meta.incidentId, {
+        type: "CHAT_SEND",
+        msgId,
+        incidentId: meta.incidentId,
+        from: meta.responderId,
+        text,
+        at: Date.now(),
+        });
+
+        return;
+    }
+
+    /* Default broadcast */
     broadcastToIncident(meta.incidentId, {
         ...msg,
+        msgId,
         incidentId: meta.incidentId,
         from: meta.responderId,
         at: Date.now(),
     });
     });
 
-    /* ---- Cleanup on Disconnect ---- */
     ws.on("close", () => {
     const meta = clientMeta.get(ws);
     if (meta) {
         const set = rooms.get(meta.incidentId);
         set?.delete(ws);
-
-        if (set && set.size === 0) {
-        rooms.delete(meta.incidentId);
-        }
+        if (set && set.size === 0) rooms.delete(meta.incidentId);
 
         clientMeta.delete(ws);
 
@@ -333,7 +353,7 @@ wss.on("connection", (ws) => {
 });
 
 /* =========================
-    Server Startup
+    Startup
     ========================= */
 server.listen(3000, () => {
     console.log("Fireline edge server listening on port 3000");
