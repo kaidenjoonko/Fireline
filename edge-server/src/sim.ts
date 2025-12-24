@@ -1,6 +1,9 @@
 import WebSocket = require("ws");
 const readline = require("readline");
 import crypto = require("crypto");
+import protocol = require("./protocol");
+
+const { MSG } = protocol;
 
 type OutboxItem = {
   msgId: string;
@@ -15,15 +18,14 @@ const EDGE_URL = process.env.EDGE_URL ?? "ws://localhost:3000";
 const INCIDENT_ID = process.env.INCIDENT_ID ?? "I1";
 const RESPONDER_ID = process.env.RESPONDER_ID ?? "A";
 
-// Priorities: SOS highest, then safety (future), then location, then chat
 function priorityFor(type: string): number {
   switch (type) {
-    case "SOS_RAISE":
-    case "SOS_CLEAR":
+    case MSG.SOS_RAISE:
+    case MSG.SOS_CLEAR:
       return 0;
-    case "LOCATION_UPDATE":
+    case MSG.LOCATION_UPDATE:
       return 2;
-    case "CHAT_SEND":
+    case MSG.CHAT_SEND:
       return 3;
     default:
       return 5;
@@ -38,20 +40,14 @@ class ResponderSim {
   private ws: WebSocket | null = null;
   private connected = false;
 
-  // Messages waiting to be ACKed
   private outbox: OutboxItem[] = [];
   private pending = new Map<string, OutboxItem>();
 
-  // Resend cadence (simple and effective)
   private RESEND_AFTER_MS = 1500;
 
   start() {
     this.connect();
-
-    // resend loop
     setInterval(() => this.flushOutbox(), 300);
-
-    // CLI
     this.setupCli();
   }
 
@@ -64,10 +60,9 @@ class ResponderSim {
       this.connected = true;
       console.log("[sim] connected");
 
-      // Resync sequence: join then snapshot arrives
       ws.send(
         JSON.stringify({
-          type: "CLIENT_HELLO",
+          type: MSG.CLIENT_HELLO,
           incidentId: INCIDENT_ID,
           responderId: RESPONDER_ID,
         })
@@ -84,7 +79,7 @@ class ResponderSim {
         return;
       }
 
-      if (msg.type === "INCIDENT_SNAPSHOT") {
+      if (msg.type === MSG.INCIDENT_SNAPSHOT) {
         console.log(
           `[sim] SNAPSHOT responders=${JSON.stringify(msg.responders)} locations=${JSON.stringify(
             msg.locations
@@ -93,7 +88,7 @@ class ResponderSim {
         return;
       }
 
-      if (msg.type === "ACK_MSG") {
+      if (msg.type === MSG.ACK_MSG) {
         const id = msg.msgId;
         if (this.pending.has(id)) {
           this.pending.delete(id);
@@ -103,7 +98,7 @@ class ResponderSim {
         return;
       }
 
-      if (msg.type === "ERROR") {
+      if (msg.type === MSG.ERROR) {
         console.log("[sim] ERROR:", msg.error);
         return;
       }
@@ -192,12 +187,12 @@ class ResponderSim {
 
       if (cmd === "sos") {
         const note = rest.join(" ").trim();
-        this.enqueue("SOS_RAISE", note ? { note } : {});
+        this.enqueue(MSG.SOS_RAISE, note ? { note } : {});
         return;
       }
 
       if (cmd === "clear") {
-        this.enqueue("SOS_CLEAR", {});
+        this.enqueue(MSG.SOS_CLEAR, {});
         return;
       }
 
@@ -207,7 +202,7 @@ class ResponderSim {
           console.log("[sim] chat requires text");
           return;
         }
-        this.enqueue("CHAT_SEND", { text });
+        this.enqueue(MSG.CHAT_SEND, { text });
         return;
       }
 
@@ -218,7 +213,7 @@ class ResponderSim {
           console.log("[sim] loc requires numeric lat lng");
           return;
         }
-        this.enqueue("LOCATION_UPDATE", { lat, lng, accuracy: 8 });
+        this.enqueue(MSG.LOCATION_UPDATE, { lat, lng, accuracy: 8 });
         return;
       }
 

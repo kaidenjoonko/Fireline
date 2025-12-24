@@ -2,6 +2,7 @@
 Fireline Edge Server
     - Local incident coordination (HTTP + WebSocket)
     - Reliability: msgId + ACK + dedup (TTL)
+    - Presence: join/leave broadcasts
 ===================================================== */
 
 console.log("Fireline edge server starting...");
@@ -12,6 +13,9 @@ console.log("Fireline edge server starting...");
 import express = require("express");
 import http = require("http");
 import WebSocket = require("ws");
+import protocol = require("./protocol");
+
+const { MSG } = protocol;
 
 /* =========================
     App + Server Initialization
@@ -64,11 +68,11 @@ function send(ws: WebSocket, payload: unknown) {
 }
 
 function error(ws: WebSocket, message: string) {
-    send(ws, { type: "ERROR", error: message, at: Date.now() });
+    send(ws, { type: MSG.ERROR, error: message, at: Date.now() });
 }
 
 function ack(ws: WebSocket, msgId: string) {
-    send(ws, { type: "ACK_MSG", msgId, at: Date.now() });
+    send(ws, { type: MSG.ACK_MSG, msgId, at: Date.now() });
 }
 
 function broadcastToIncident(incidentId: string, payload: unknown) {
@@ -179,7 +183,7 @@ wss.on("connection", (ws) => {
     }
 
     /* ---- Handshake ---- */
-    if (msg.type === "CLIENT_HELLO") {
+    if (msg.type === MSG.CLIENT_HELLO) {
         const incidentId = String(msg.incidentId ?? "");
         const responderId = String(msg.responderId ?? "");
 
@@ -188,15 +192,27 @@ wss.on("connection", (ws) => {
         return;
         }
 
+        // Bind identity to this socket
         clientMeta.set(ws, { incidentId, responderId });
 
+        // Add socket to incident room
         if (!rooms.has(incidentId)) rooms.set(incidentId, new Set());
         rooms.get(incidentId)!.add(ws);
 
-        send(ws, { type: "ACK", message: "Joined incident", incidentId, at: Date.now() });
+        // Confirm join
+        send(ws, { type: MSG.ACK, message: "Joined incident", incidentId, at: Date.now() });
 
+        // NEW: broadcast presence join to the incident room
+        broadcastToIncident(incidentId, {
+        type: MSG.PRESENCE_JOIN,
+        incidentId,
+        responderId,
+        at: Date.now(),
+        });
+
+        // Send snapshot to the joining socket (state hydration)
         send(ws, {
-        type: "INCIDENT_SNAPSHOT",
+        type: MSG.INCIDENT_SNAPSHOT,
         incidentId,
         responders: getIncidentResponderIds(incidentId),
         locations: getIncidentLocations(incidentId),
@@ -231,7 +247,7 @@ wss.on("connection", (ws) => {
     ack(ws, msgId);
 
     /* ---- LOCATION_UPDATE ---- */
-    if (msg.type === "LOCATION_UPDATE") {
+    if (msg.type === MSG.LOCATION_UPDATE) {
         const { lat, lng, accuracy } = msg;
 
         if (!isValidLatLng(lat, lng)) {
@@ -249,7 +265,7 @@ wss.on("connection", (ws) => {
         lastLocationByResponder.set(meta.responderId, location);
 
         broadcastToIncident(meta.incidentId, {
-        type: "LOCATION_UPDATE",
+        type: MSG.LOCATION_UPDATE,
         msgId,
         incidentId: meta.incidentId,
         responderId: meta.responderId,
@@ -260,7 +276,7 @@ wss.on("connection", (ws) => {
     }
 
     /* ---- SOS_RAISE ---- */
-    if (msg.type === "SOS_RAISE") {
+    if (msg.type === MSG.SOS_RAISE) {
         const note = typeof msg.note === "string" ? msg.note : undefined;
 
         if (!activeSosByIncident.has(meta.incidentId)) activeSosByIncident.set(meta.incidentId, new Map());
@@ -274,7 +290,7 @@ wss.on("connection", (ws) => {
         incidentSos.set(meta.responderId, sosState);
 
         broadcastToIncident(meta.incidentId, {
-        type: "SOS_RAISE",
+        type: MSG.SOS_RAISE,
         msgId,
         incidentId: meta.incidentId,
         responderId: meta.responderId,
@@ -285,13 +301,13 @@ wss.on("connection", (ws) => {
     }
 
     /* ---- SOS_CLEAR ---- */
-    if (msg.type === "SOS_CLEAR") {
+    if (msg.type === MSG.SOS_CLEAR) {
         const incidentSos = activeSosByIncident.get(meta.incidentId);
         incidentSos?.delete(meta.responderId);
         if (incidentSos && incidentSos.size === 0) activeSosByIncident.delete(meta.incidentId);
 
         broadcastToIncident(meta.incidentId, {
-        type: "SOS_CLEAR",
+        type: MSG.SOS_CLEAR,
         msgId,
         incidentId: meta.incidentId,
         responderId: meta.responderId,
@@ -302,7 +318,7 @@ wss.on("connection", (ws) => {
     }
 
     /* ---- CHAT_SEND ---- */
-    if (msg.type === "CHAT_SEND") {
+    if (msg.type === MSG.CHAT_SEND) {
         const text = String(msg.text ?? "");
         if (!text) {
         error(ws, "CHAT_SEND requires text");
@@ -310,7 +326,7 @@ wss.on("connection", (ws) => {
         }
 
         broadcastToIncident(meta.incidentId, {
-        type: "CHAT_SEND",
+        type: MSG.CHAT_SEND,
         msgId,
         incidentId: meta.incidentId,
         from: meta.responderId,
@@ -341,7 +357,7 @@ wss.on("connection", (ws) => {
         clientMeta.delete(ws);
 
         broadcastToIncident(meta.incidentId, {
-        type: "PRESENCE_LEAVE",
+        type: MSG.PRESENCE_LEAVE,
         incidentId: meta.incidentId,
         responderId: meta.responderId,
         at: Date.now(),
