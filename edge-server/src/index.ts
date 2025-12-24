@@ -29,7 +29,8 @@ const app = express();
     lastLocationByResponder:
     responderId -> { lat, lng, accuracy?, at }
 
-    //incidentId -> (responderId => SosState)
+    activeSosByIncident:
+    incidentId -> (responderId -> SosState)
 */
 const rooms = new Map<string, Set<WebSocket>>();
 const clientMeta = new Map<WebSocket, { incidentId: string; responderId: string }>();
@@ -40,14 +41,15 @@ type Location = {
     accuracy?: number;
     at: number; // server timestamp (ms)
 };
+
 const lastLocationByResponder = new Map<string, Location>();
 
 type SosState = {
     note?: string;
     at: number; // server timestamp when SOS was raised
-}
-const activeSosByIncident = new Map<string, Map<string, SosState>>();
+};
 
+const activeSosByIncident = new Map<string, Map<string, SosState>>();
 
 /* =========================
     Helpers
@@ -113,7 +115,6 @@ function isValidLatLng(lat: unknown, lng: unknown): lat is number {
 
 /**
 * Gather last-known locations for responders currently in an incident.
-* Only includes responders that have a stored location.
 */
 function getIncidentLocations(incidentId: string): Record<string, Location> {
     const responderIds = getIncidentResponderIds(incidentId);
@@ -127,15 +128,15 @@ function getIncidentLocations(incidentId: string): Record<string, Location> {
 }
 
 /**
- * Gather active SOS states for responders currently in an incident.
- */
+* Gather active SOS states for responders currently in an incident.
+*/
 function getIncidentSos(incidentId: string): Record<string, SosState> {
     const incidentSos = activeSosByIncident.get(incidentId);
     if (!incidentSos) return {};
 
     const out: Record<string, SosState> = {};
     for (const [responderId, sos] of incidentSos.entries()) {
-        out[responderId] = sos;
+    out[responderId] = sos;
     }
     return out;
 }
@@ -167,10 +168,7 @@ wss.on("connection", (ws) => {
         return;
     }
 
-    /* ---- Handshake: Join Incident Room ----
-        First message must be CLIENT_HELLO so the server can bind:
-        socket -> {incidentId, responderId}
-    */
+    /* ---- Handshake: Join Incident Room ---- */
     if (msg.type === "CLIENT_HELLO") {
         const incidentId = String(msg.incidentId ?? "");
         const responderId = String(msg.responderId ?? "");
@@ -185,14 +183,11 @@ wss.on("connection", (ws) => {
         return;
         }
 
-        // Bind identity to socket (server truth)
         clientMeta.set(ws, { incidentId, responderId });
 
-        // Add socket to incident room
         if (!rooms.has(incidentId)) rooms.set(incidentId, new Set());
         rooms.get(incidentId)!.add(ws);
 
-        // Confirm join
         ws.send(
         JSON.stringify({
             type: "ACK",
@@ -201,23 +196,20 @@ wss.on("connection", (ws) => {
         })
         );
 
-        // Send incident snapshot (presence + last-known locations + sos)
-        const responders = getIncidentResponderIds(incidentId);
-        const locations = getIncidentLocations(incidentId);
-        const sos = getIncidentSos(incidentId);
-        
         ws.send(
-          JSON.stringify({
+        JSON.stringify({
             type: "INCIDENT_SNAPSHOT",
             incidentId,
-            responders,
-            locations,
-            sos,
-          })
+            responders: getIncidentResponderIds(incidentId),
+            locations: getIncidentLocations(incidentId),
+            sos: getIncidentSos(incidentId),
+        })
         );
+
+        return; // IMPORTANT: stop processing this message
     }
 
-    // Must have joined an incident before sending any other messages
+    /* ---- Must be joined after this point ---- */
     const meta = clientMeta.get(ws);
     if (!meta) {
         ws.send(
@@ -229,9 +221,7 @@ wss.on("connection", (ws) => {
         return;
     }
 
-    /* ---- Location Updates ----
-        Clients send lat/lng; server validates, stores last-known, and broadcasts.
-    */
+    /* ---- Location Updates ---- */
     if (msg.type === "LOCATION_UPDATE") {
         const lat = msg.lat;
         const lng = msg.lng;
@@ -243,18 +233,16 @@ wss.on("connection", (ws) => {
         }
 
         const location: Location = {
-            lat,
-            lng,
-            at: Date.now(),
-            ...(typeof accuracy === "number" && Number.isFinite(accuracy)
-              ? { accuracy }
-              : {}),
+        lat,
+        lng,
+        at: Date.now(),
+        ...(typeof accuracy === "number" && Number.isFinite(accuracy)
+            ? { accuracy }
+            : {}),
         };
 
-        // Store last-known location by responder identity (stable across reconnects)
         lastLocationByResponder.set(meta.responderId, location);
 
-        // Broadcast location update within incident
         broadcastToIncident(meta.incidentId, {
         type: "LOCATION_UPDATE",
         incidentId: meta.incidentId,
@@ -265,60 +253,52 @@ wss.on("connection", (ws) => {
         return;
     }
 
-    /* ---- SOS Updates ----
-        Clients send SOS state; server stores and broadcasts.
-    */
+    /* ---- SOS Updates ---- */
     if (msg.type === "SOS_RAISE") {
         const note = typeof msg.note === "string" ? msg.note : undefined;
-        
+
         if (!activeSosByIncident.has(meta.incidentId)) {
-            activeSosByIncident.set(meta.incidentId, new Map());
+        activeSosByIncident.set(meta.incidentId, new Map());
         }
-        
+
         const incidentSos = activeSosByIncident.get(meta.incidentId)!;
-        
-        // exactOptionalPropertyTypes-safe: only include note if defined
+
         const sosState: SosState = {
-            at: Date.now(),
-            ...(note ? { note } : {}),
+        at: Date.now(),
+        ...(note ? { note } : {}),
         };
-        
-        // Store as active SOS for this responder in this incident
+
         incidentSos.set(meta.responderId, sosState);
-        
-        // Broadcast to the incident room immediately
+
         broadcastToIncident(meta.incidentId, {
-            type: "SOS_RAISE",
-            incidentId: meta.incidentId,
-            responderId: meta.responderId,
-            ...sosState,
+        type: "SOS_RAISE",
+        incidentId: meta.incidentId,
+        responderId: meta.responderId,
+        ...sosState,
         });
-        
-        return;
-    }
-    
-    if (msg.type === "SOS_CLEAR") {
-        const incidentSos = activeSosByIncident.get(meta.incidentId);
-        incidentSos?.delete(meta.responderId);
-      
-        // Cleanup empty incident SOS map
-        if (incidentSos && incidentSos.size === 0) {
-          activeSosByIncident.delete(meta.incidentId);
-        }
-      
-        broadcastToIncident(meta.incidentId, {
-          type: "SOS_CLEAR",
-          incidentId: meta.incidentId,
-          responderId: meta.responderId,
-          at: Date.now(),
-        });
-      
+
         return;
     }
 
-    /* ---- Default: broadcast message within incident ----
-        Server enforces incident + sender identity.
-    */
+    if (msg.type === "SOS_CLEAR") {
+        const incidentSos = activeSosByIncident.get(meta.incidentId);
+        incidentSos?.delete(meta.responderId);
+
+        if (incidentSos && incidentSos.size === 0) {
+        activeSosByIncident.delete(meta.incidentId);
+        }
+
+        broadcastToIncident(meta.incidentId, {
+        type: "SOS_CLEAR",
+        incidentId: meta.incidentId,
+        responderId: meta.responderId,
+        at: Date.now(),
+        });
+
+        return;
+    }
+
+    /* ---- Default: broadcast message within incident ---- */
     broadcastToIncident(meta.incidentId, {
         ...msg,
         incidentId: meta.incidentId,
@@ -327,9 +307,7 @@ wss.on("connection", (ws) => {
     });
     });
 
-    /* ---- Cleanup on Disconnect ----
-    Remove socket from room and metadata; notify others.
-    */
+    /* ---- Cleanup on Disconnect ---- */
     ws.on("close", () => {
     const meta = clientMeta.get(ws);
     if (meta) {
