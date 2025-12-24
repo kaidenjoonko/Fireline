@@ -25,9 +25,14 @@ const app = express();
 
     clientMeta:
     socket -> { incidentId, responderId }
+
+    location:
+    responderId -> { lat, lng, accuracy, at}
 */
 const rooms = new Map<string, Set<WebSocket>>();
 const clientMeta = new Map<WebSocket, { incidentId: string; responderId: string }>();
+type Location = { lat: number; lng: number; accuracy: number | undefined; at: number };
+const lastLocationByReponsder = new Map<string, Location>();
 
 /* =========================
     Helpers
@@ -73,7 +78,35 @@ function getIncidentResponderIds(incidentID: string): string[] {
     }
     return responderIds;
 }
+/**
+ * Check if latitude and longitude are valid numbers
+ */
+function isValidLatLng(lat: any, lng: any): lat is number {
+    return(
+        typeof lat == "number" &&
+        typeof lng == "number" &&
+        Number.isFinite(lat) &&
+        Number.isFinite(lng) &&
+        lat >= -90 &&
+        lat <= 90 &&
+        lng >= -180 &&
+        lng <= 180
+    );
+}
 
+/**
+ *  gather last known locations for an incident
+ */
+function getIncidentLocations(incidentId: string): Record<string, Location> {
+    const responderIds = getIncidentResponderIds(incidentId);
+
+    const locations: Record<string, Location> = {};
+    for (const id of responderIds) {
+        const loc = lastLocationByReponsder.get(id);
+        if (loc) locations[id] = loc;
+    }
+    return locations;
+}
 
 /* =========================
     HTTP Endpoints
@@ -134,13 +167,14 @@ wss.on("connection", (ws) => {
 
     //send the snapshot right after a successful join 
     const responders = getIncidentResponderIds(incidentId);
-    ws.send(
-        JSON.stringify({
-            type: "INCIDENT_SNAPSHOT",
-            incidentId,
-            responders,
-        })
-    );
+    const locations = getIncidentLocations(incidentId);
+    
+    ws.send(JSON.stringify({
+      type: "INCIDENT_SNAPSHOT",
+      incidentId,
+      responders,
+      locations,
+    }));
     return;
     }
 
@@ -148,6 +182,37 @@ wss.on("connection", (ws) => {
     const meta = clientMeta.get(ws);
     if (!meta) {
         ws.send(JSON.stringify({ type: "ERROR", error: "Must send CLIENT_HELLO before other messages" }));
+        return;
+    }
+    // ---- Handle Location Update ----
+    if (msg.type === "LOCATION_UPDATE") {
+        const lat = msg.lat;
+        const lng = msg.lng;
+        const accuracy = msg.accuracy;
+      
+        if (!isValidLatLng(lat, lng)) {
+          ws.send(JSON.stringify({ type: "ERROR", error: "Invalid lat/lng" }));
+          return;
+        }
+      
+        const location = {
+          lat,
+          lng,
+          accuracy: typeof accuracy === "number" && Number.isFinite(accuracy) ? accuracy : undefined,
+          at: Date.now(),
+        };
+      
+        // Store last-known location by responder identity (stable across reconnects)
+        lastLocationByReponsder.set(meta.responderId, location);
+      
+        // Broadcast the update to everyone in the incident (including sender)
+        broadcastToIncident(meta.incidentId, {
+          type: "LOCATION_UPDATE",
+          incidentId: meta.incidentId,
+          responderId: meta.responderId,
+          ...location,
+        });
+      
         return;
     }
 
