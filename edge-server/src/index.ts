@@ -26,13 +26,20 @@ const app = express();
     clientMeta:
     socket -> { incidentId, responderId }
 
-    location:
-    responderId -> { lat, lng, accuracy, at}
+    lastLocationByResponder:
+    responderId -> { lat, lng, accuracy?, at }
 */
 const rooms = new Map<string, Set<WebSocket>>();
 const clientMeta = new Map<WebSocket, { incidentId: string; responderId: string }>();
-type Location = { lat: number; lng: number; accuracy: number | undefined; at: number };
-const lastLocationByReponsder = new Map<string, Location>();
+
+type Location = {
+    lat: number;
+    lng: number;
+    accuracy?: number;
+    at: number; // server timestamp (ms)
+};
+
+const lastLocationByResponder = new Map<string, Location>();
 
 /* =========================
     Helpers
@@ -64,46 +71,49 @@ function broadcastToIncident(incidentId: string, payload: unknown) {
     }
     }
 }
+
 /**
- * Get the list of responder IDs currently in an incident room.
- */
-function getIncidentResponderIds(incidentID: string): string[] {
-    const clients = rooms.get(incidentID);
+* Get the list of responder IDs currently in an incident room.
+*/
+function getIncidentResponderIds(incidentId: string): string[] {
+    const clients = rooms.get(incidentId);
     if (!clients) return [];
 
     const responderIds: string[] = [];
     for (const client of clients) {
-        const meta = clientMeta.get(client);
-        if (meta) responderIds.push(meta.responderId);
+    const meta = clientMeta.get(client);
+    if (meta) responderIds.push(meta.responderId);
     }
     return responderIds;
 }
+
 /**
- * Check if latitude and longitude are valid numbers
- */
-function isValidLatLng(lat: any, lng: any): lat is number {
-    return(
-        typeof lat == "number" &&
-        typeof lng == "number" &&
-        Number.isFinite(lat) &&
-        Number.isFinite(lng) &&
-        lat >= -90 &&
-        lat <= 90 &&
-        lng >= -180 &&
-        lng <= 180
+* Validate latitude/longitude.
+*/
+function isValidLatLng(lat: unknown, lng: unknown): lat is number {
+    return (
+    typeof lat === "number" &&
+    typeof lng === "number" &&
+    Number.isFinite(lat) &&
+    Number.isFinite(lng) &&
+    lat >= -90 &&
+    lat <= 90 &&
+    lng >= -180 &&
+    lng <= 180
     );
 }
 
 /**
- *  gather last known locations for an incident
- */
+* Gather last-known locations for responders currently in an incident.
+* Only includes responders that have a stored location.
+*/
 function getIncidentLocations(incidentId: string): Record<string, Location> {
     const responderIds = getIncidentResponderIds(incidentId);
 
     const locations: Record<string, Location> = {};
     for (const id of responderIds) {
-        const loc = lastLocationByReponsder.get(id);
-        if (loc) locations[id] = loc;
+    const loc = lastLocationByResponder.get(id);
+    if (loc) locations[id] = loc;
     }
     return locations;
 }
@@ -135,12 +145,15 @@ wss.on("connection", (ws) => {
         return;
     }
 
-    // ---- Handshake: Join Incident Room ----
+    /* ---- Handshake: Join Incident Room ----
+        First message must be CLIENT_HELLO so the server can bind:
+        socket -> {incidentId, responderId}
+    */
     if (msg.type === "CLIENT_HELLO") {
         const incidentId = String(msg.incidentId ?? "");
         const responderId = String(msg.responderId ?? "");
 
-    if (!incidentId || !responderId) {
+        if (!incidentId || !responderId) {
         ws.send(
             JSON.stringify({
             type: "ERROR",
@@ -148,84 +161,102 @@ wss.on("connection", (ws) => {
             })
         );
         return;
-    }
+        }
 
-    clientMeta.set(ws, { incidentId, responderId });
+        // Bind identity to socket (server truth)
+        clientMeta.set(ws, { incidentId, responderId });
 
-    if (!rooms.has(incidentId)) {
-        rooms.set(incidentId, new Set());
-    }
-    rooms.get(incidentId)!.add(ws);
+        // Add socket to incident room
+        if (!rooms.has(incidentId)) rooms.set(incidentId, new Set());
+        rooms.get(incidentId)!.add(ws);
 
-    ws.send(
+        // Confirm join
+        ws.send(
         JSON.stringify({
             type: "ACK",
             message: "Joined incident",
             incidentId,
         })
-    );
+        );
 
-    //send the snapshot right after a successful join 
-    const responders = getIncidentResponderIds(incidentId);
-    const locations = getIncidentLocations(incidentId);
-    
-    ws.send(JSON.stringify({
-      type: "INCIDENT_SNAPSHOT",
-      incidentId,
-      responders,
-      locations,
-    }));
-    return;
-    }
+        // Send incident snapshot (presence + last-known locations)
+        const responders = getIncidentResponderIds(incidentId);
+        const locations = getIncidentLocations(incidentId);
 
-    // Must have joined an incident before sending other messages
-    const meta = clientMeta.get(ws);
-    if (!meta) {
-        ws.send(JSON.stringify({ type: "ERROR", error: "Must send CLIENT_HELLO before other messages" }));
+        ws.send(
+        JSON.stringify({
+            type: "INCIDENT_SNAPSHOT",
+            incidentId,
+            responders,
+            locations,
+        })
+        );
+
         return;
     }
-    // ---- Handle Location Update ----
+
+    // Must have joined an incident before sending any other messages
+    const meta = clientMeta.get(ws);
+    if (!meta) {
+        ws.send(
+        JSON.stringify({
+            type: "ERROR",
+            error: "Must send CLIENT_HELLO before other messages",
+        })
+        );
+        return;
+    }
+
+    /* ---- Location Updates ----
+        Clients send lat/lng; server validates, stores last-known, and broadcasts.
+    */
     if (msg.type === "LOCATION_UPDATE") {
         const lat = msg.lat;
         const lng = msg.lng;
         const accuracy = msg.accuracy;
-      
+
         if (!isValidLatLng(lat, lng)) {
-          ws.send(JSON.stringify({ type: "ERROR", error: "Invalid lat/lng" }));
-          return;
+        ws.send(JSON.stringify({ type: "ERROR", error: "Invalid lat/lng" }));
+        return;
         }
-      
-        const location = {
-          lat,
-          lng,
-          accuracy: typeof accuracy === "number" && Number.isFinite(accuracy) ? accuracy : undefined,
-          at: Date.now(),
+
+        const location: Location = {
+            lat,
+            lng,
+            at: Date.now(),
+            ...(typeof accuracy === "number" && Number.isFinite(accuracy)
+              ? { accuracy }
+              : {}),
         };
-      
+
         // Store last-known location by responder identity (stable across reconnects)
-        lastLocationByReponsder.set(meta.responderId, location);
-      
-        // Broadcast the update to everyone in the incident (including sender)
+        lastLocationByResponder.set(meta.responderId, location);
+
+        // Broadcast location update within incident
         broadcastToIncident(meta.incidentId, {
-          type: "LOCATION_UPDATE",
-          incidentId: meta.incidentId,
-          responderId: meta.responderId,
-          ...location,
+        type: "LOCATION_UPDATE",
+        incidentId: meta.incidentId,
+        responderId: meta.responderId,
+        ...location,
         });
-      
+
         return;
     }
 
-    // Broadcast within the same incident room
+    /* ---- Default: broadcast message within incident ----
+        Server enforces incident + sender identity.
+    */
     broadcastToIncident(meta.incidentId, {
         ...msg,
-        incidentId: meta.incidentId, // enforce server truth
+        incidentId: meta.incidentId,
         from: meta.responderId,
         at: Date.now(),
     });
     });
 
-    // ---- Cleanup on Disconnect ----
+    /* ---- Cleanup on Disconnect ----
+    Remove socket from room and metadata; notify others.
+    */
     ws.on("close", () => {
     const meta = clientMeta.get(ws);
     if (meta) {
@@ -238,7 +269,6 @@ wss.on("connection", (ws) => {
 
         clientMeta.delete(ws);
 
-        // Optional: notify others someone left
         broadcastToIncident(meta.incidentId, {
         type: "PRESENCE_LEAVE",
         incidentId: meta.incidentId,
