@@ -12,6 +12,7 @@ console.log("Fireline edge server starting...");
     ========================= */
 import express = require("express");
 import http = require("http");
+import path = require("path");
 import WebSocket = require("ws");
 import protocol = require("./protocol");
 
@@ -158,6 +159,8 @@ setInterval(() => {
 /* =========================
     HTTP Endpoints
     ========================= */
+app.use(express.static(path.join(__dirname, "../../dashboard")));
+
 app.get("/health", (_req, res) => {
     res.json({ ok: true });
 });

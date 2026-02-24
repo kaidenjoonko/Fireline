@@ -45,6 +45,10 @@ class ResponderSim {
 
   private RESEND_AFTER_MS = 1500;
 
+  private walkInterval: ReturnType<typeof setInterval> | null = null;
+  private walkLat = 0;
+  private walkLng = 0;
+
   start() {
     this.connect();
     setInterval(() => this.flushOutbox(), 300);
@@ -175,7 +179,9 @@ class ResponderSim {
     console.log("  sos [note]         -> raise SOS");
     console.log("  clear              -> clear SOS");
     console.log("  chat <text>        -> send chat");
-    console.log("  loc <lat> <lng>    -> send location update");
+    console.log("  loc <lat> <lng>    -> send one location update");
+    console.log("  walk <lat> <lng>   -> start auto-walking (sends location every 3s)");
+    console.log("  stop               -> stop auto-walk");
     console.log("  drop               -> simulate disconnect (close socket)");
     console.log("  status             -> show outbox/pending counts");
     console.log("");
@@ -225,6 +231,41 @@ class ResponderSim {
 
       if (cmd === "status") {
         console.log(`[sim] connected=${this.connected} outbox=${this.outbox.length} pending=${this.pending.size}`);
+        return;
+      }
+
+      if (cmd === "walk") {
+        const lat = Number(rest[0]);
+        const lng = Number(rest[1]);
+        if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+          console.log("[sim] walk requires starting lat lng  (e.g. walk 37.78 -122.41)");
+          return;
+        }
+        if (this.walkInterval) clearInterval(this.walkInterval);
+        this.walkLat = lat;
+        this.walkLng = lng;
+        console.log(`[sim] auto-walk started from ${lat}, ${lng} — type 'stop' to halt`);
+        this.enqueue(MSG.LOCATION_UPDATE, { lat: this.walkLat, lng: this.walkLng, accuracy: 8 });
+        this.walkInterval = setInterval(() => {
+          this.walkLat += (Math.random() - 0.5) * 0.001;
+          this.walkLng += (Math.random() - 0.5) * 0.001;
+          this.enqueue(MSG.LOCATION_UPDATE, {
+            lat: parseFloat(this.walkLat.toFixed(6)),
+            lng: parseFloat(this.walkLng.toFixed(6)),
+            accuracy: 8,
+          });
+        }, 3000);
+        return;
+      }
+
+      if (cmd === "stop") {
+        if (this.walkInterval) {
+          clearInterval(this.walkInterval);
+          this.walkInterval = null;
+          console.log("[sim] auto-walk stopped");
+        } else {
+          console.log("[sim] not walking");
+        }
         return;
       }
 

@@ -1,0 +1,825 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FIRELINE — Command Dashboard</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    :root {
+      --bg:        #050a12;
+      --panel:     rgba(255,255,255,0.03);
+      --border:    rgba(255,255,255,0.08);
+      --text:      #c8d8e8;
+      --text-dim:  rgba(200,216,232,0.45);
+      --green:     #00e87a;
+      --red:       #ff3a3a;
+      --orange:    #ff9500;
+      --blue:      #4a9eff;
+      --mono:      'Courier New', Courier, monospace;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: var(--mono);
+      background: var(--bg);
+      color: var(--text);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* ─── HEADER ─────────────────────────────── */
+    header {
+      height: 52px;
+      display: flex;
+      align-items: center;
+      padding: 0 20px;
+      border-bottom: 1px solid var(--border);
+      background: rgba(0,0,0,0.5);
+      gap: 16px;
+      flex-shrink: 0;
+      position: relative;
+      z-index: 10;
+    }
+
+    .logo {
+      font-size: 17px;
+      font-weight: bold;
+      letter-spacing: 5px;
+      color: var(--orange);
+    }
+    .logo-icon { color: var(--red); margin-right: 4px; }
+
+    .vdivider {
+      width: 1px;
+      height: 24px;
+      background: var(--border);
+    }
+
+    .header-chip {
+      display: flex;
+      flex-direction: column;
+      gap: 1px;
+    }
+    .header-chip-label {
+      font-size: 9px;
+      letter-spacing: 2px;
+      color: var(--text-dim);
+    }
+    .header-chip-value {
+      font-size: 13px;
+      color: var(--text);
+      letter-spacing: 1px;
+    }
+
+    .spacer { flex: 1; }
+
+    .status-indicator {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--text-dim);
+      transition: background 0.3s, box-shadow 0.3s;
+    }
+    .status-dot.connected    { background: var(--green); box-shadow: 0 0 8px var(--green); }
+    .status-dot.connecting   { background: var(--orange); animation: blink 0.5s infinite; }
+    .status-dot.disconnected { background: var(--red); }
+    .status-label {
+      font-size: 10px;
+      letter-spacing: 2px;
+      transition: color 0.3s;
+    }
+    .status-label.connected    { color: var(--green); }
+    .status-label.connecting   { color: var(--orange); }
+    .status-label.disconnected { color: var(--red); }
+
+    /* ─── SOS BANNER ─────────────────────────── */
+    #sosBanner {
+      display: none;
+      padding: 10px 20px 10px;
+      border-bottom: 2px solid var(--red);
+      background: linear-gradient(135deg, #1a0000 0%, #2e0000 100%);
+      flex-shrink: 0;
+      position: relative;
+      z-index: 10;
+      animation: sos-bg 1s ease-in-out infinite;
+    }
+    #sosBanner.active { display: block; }
+
+    @keyframes sos-bg {
+      0%, 100% { background: linear-gradient(135deg, #1a0000, #2d0000); }
+      50%       { background: linear-gradient(135deg, #2d0000, #440000); }
+    }
+
+    .sos-banner-header {
+      font-size: 10px;
+      letter-spacing: 3px;
+      color: var(--red);
+      margin-bottom: 8px;
+    }
+    .sos-list {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .sos-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: rgba(255,58,58,0.08);
+      border: 1px solid rgba(255,58,58,0.25);
+      padding: 5px 12px;
+      border-radius: 4px;
+      animation: sos-item-pulse 1s infinite;
+    }
+    @keyframes sos-item-pulse {
+      0%, 100% { border-color: rgba(255,58,58,0.25); }
+      50%       { border-color: rgba(255,58,58,0.65); }
+    }
+    .sos-item-id   { color: var(--red); font-weight: bold; font-size: 13px; }
+    .sos-item-note { color: var(--text-dim); font-size: 11px; }
+    .sos-item-age  { color: var(--text-dim); font-size: 10px; margin-left: 4px; }
+
+    /* ─── MAIN ───────────────────────────────── */
+    main {
+      flex: 1;
+      display: flex;
+      overflow: hidden;
+    }
+
+    /* ─── SIDEBAR ────────────────────────────── */
+    .sidebar {
+      width: 270px;
+      flex-shrink: 0;
+      display: flex;
+      flex-direction: column;
+      border-right: 1px solid var(--border);
+      overflow: hidden;
+    }
+
+    .panel {
+      display: flex;
+      flex-direction: column;
+      border-bottom: 1px solid var(--border);
+    }
+    .panel-header {
+      padding: 9px 14px;
+      font-size: 9px;
+      letter-spacing: 3px;
+      color: var(--text-dim);
+      background: rgba(0,0,0,0.25);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-shrink: 0;
+    }
+    .panel-badge {
+      background: rgba(255,255,255,0.07);
+      padding: 1px 6px;
+      border-radius: 10px;
+      font-size: 10px;
+      color: var(--text);
+      font-family: var(--mono);
+    }
+
+    /* responders */
+    .responders-panel { max-height: 220px; }
+    #responderList {
+      overflow-y: auto;
+      padding: 6px;
+    }
+    .resp-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      transition: background 0.15s;
+      cursor: default;
+    }
+    .resp-item:hover { background: var(--panel); }
+    .resp-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      flex-shrink: 0;
+      transition: background 0.3s;
+    }
+    .resp-dot.online  { background: var(--green); box-shadow: 0 0 5px var(--green); }
+    .resp-dot.offline { background: var(--text-dim); }
+    .resp-id { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .resp-id.offline { color: var(--text-dim); text-decoration: line-through; }
+    .tag {
+      font-size: 9px;
+      padding: 1px 5px;
+      border-radius: 3px;
+      font-family: var(--mono);
+    }
+    .tag-sos { background: rgba(255,58,58,0.15); color: var(--red); border: 1px solid rgba(255,58,58,0.3); }
+    .tag-gps { background: rgba(74,158,255,0.1); color: var(--blue); border: 1px solid rgba(74,158,255,0.2); }
+
+    /* chat */
+    .chat-panel { flex: 1; overflow: hidden; }
+    #chatFeed {
+      overflow-y: auto;
+      padding: 8px;
+      height: calc(100% - 36px);
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+    .msg {
+      font-size: 11px;
+      line-height: 1.55;
+      animation: fadeSlide 0.25s ease;
+    }
+    @keyframes fadeSlide {
+      from { opacity: 0; transform: translateY(3px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    .msg-time   { color: var(--text-dim); font-size: 9px; }
+    .msg-system { color: var(--text-dim); font-style: italic; }
+    .msg-sos    { color: var(--red); }
+
+    /* ─── MAP ─────────────────────────────────── */
+    .map-wrap {
+      flex: 1;
+      position: relative;
+    }
+    #map { width: 100%; height: 100%; }
+
+    /* map stats overlay */
+    .map-stats {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      background: rgba(5,10,18,0.88);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px 14px;
+      backdrop-filter: blur(10px);
+      z-index: 999;
+      min-width: 130px;
+    }
+    .map-stats-title {
+      font-size: 9px;
+      letter-spacing: 2px;
+      color: var(--text-dim);
+      margin-bottom: 10px;
+    }
+    .stat-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 14px;
+      font-size: 11px;
+      margin-bottom: 5px;
+    }
+    .stat-label { color: var(--text-dim); }
+    .stat-val   { color: var(--text); font-weight: bold; }
+    .stat-val.sos-val { color: var(--red); }
+
+    /* ─── CONNECT OVERLAY ─────────────────────── */
+    #connectOverlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(5,10,18,0.93);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 9999;
+      backdrop-filter: blur(4px);
+    }
+
+    .connect-card {
+      background: rgba(8,14,28,0.98);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 36px;
+      width: 400px;
+      display: flex;
+      flex-direction: column;
+      gap: 22px;
+    }
+    .connect-logo {
+      font-size: 24px;
+      font-weight: bold;
+      letter-spacing: 6px;
+      color: var(--orange);
+    }
+    .connect-logo-icon { color: var(--red); }
+    .connect-sub {
+      font-size: 11px;
+      color: var(--text-dim);
+      line-height: 1.7;
+    }
+    .field { display: flex; flex-direction: column; gap: 5px; }
+    .field-label { font-size: 9px; letter-spacing: 2px; color: var(--text-dim); }
+    input[type="text"] {
+      background: rgba(255,255,255,0.04);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 10px 12px;
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 13px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    input[type="text"]:focus { border-color: rgba(255,149,0,0.45); }
+    input[type="text"]::placeholder { color: var(--text-dim); }
+
+    .btn-connect {
+      padding: 12px;
+      background: linear-gradient(135deg, rgba(255,149,0,0.12), rgba(255,58,58,0.08));
+      border: 1px solid rgba(255,149,0,0.28);
+      border-radius: 4px;
+      color: var(--orange);
+      font-family: var(--mono);
+      font-size: 12px;
+      letter-spacing: 3px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .btn-connect:hover {
+      background: linear-gradient(135deg, rgba(255,149,0,0.22), rgba(255,58,58,0.14));
+      border-color: rgba(255,149,0,0.5);
+    }
+    .btn-connect:active { transform: scale(0.99); }
+    .connect-hint {
+      font-size: 10px;
+      color: var(--text-dim);
+      text-align: center;
+      line-height: 1.6;
+    }
+
+    /* Leaflet dark-theme overrides */
+    .leaflet-container { background: #070d18 !important; }
+    .leaflet-popup-content-wrapper {
+      background: rgba(8,14,28,0.95) !important;
+      border: 1px solid var(--border) !important;
+      border-radius: 4px !important;
+      color: var(--text) !important;
+      font-family: var(--mono) !important;
+      font-size: 12px !important;
+    }
+    .leaflet-popup-tip { background: rgba(8,14,28,0.95) !important; }
+    .leaflet-control-zoom a {
+      background: rgba(8,14,28,0.9) !important;
+      border-color: var(--border) !important;
+      color: var(--text) !important;
+    }
+    .leaflet-control-zoom a:hover { background: rgba(255,255,255,0.08) !important; }
+
+    @keyframes blink {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.3; }
+    }
+
+    /* scrollbars */
+    ::-webkit-scrollbar { width: 3px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.14); }
+  </style>
+</head>
+<body>
+
+<!-- ═══ HEADER ══════════════════════════════════════════════════════ -->
+<header>
+  <span class="logo"><span class="logo-icon">▲</span>FIRELINE</span>
+  <div class="vdivider"></div>
+  <div class="header-chip">
+    <div class="header-chip-label">INCIDENT</div>
+    <div class="header-chip-value" id="hIncident">—</div>
+  </div>
+  <div class="vdivider"></div>
+  <div class="header-chip">
+    <div class="header-chip-label">VIEWER</div>
+    <div class="header-chip-value" id="hViewer">—</div>
+  </div>
+  <div class="spacer"></div>
+  <div class="status-indicator">
+    <div class="status-dot disconnected" id="statusDot"></div>
+    <div class="status-label disconnected" id="statusLabel">DISCONNECTED</div>
+  </div>
+</header>
+
+<!-- ═══ SOS BANNER ══════════════════════════════════════════════════ -->
+<div id="sosBanner">
+  <div class="sos-banner-header">⚠ ACTIVE SOS ALERTS</div>
+  <div class="sos-list" id="sosList"></div>
+</div>
+
+<!-- ═══ MAIN ════════════════════════════════════════════════════════ -->
+<main>
+  <!-- sidebar -->
+  <aside class="sidebar">
+    <!-- responders -->
+    <div class="panel responders-panel">
+      <div class="panel-header">
+        RESPONDERS
+        <span class="panel-badge" id="badgeResponders">0</span>
+      </div>
+      <div id="responderList"></div>
+    </div>
+    <!-- comms log -->
+    <div class="panel chat-panel">
+      <div class="panel-header">
+        COMMS LOG
+        <span class="panel-badge" id="badgeMsgs">0</span>
+      </div>
+      <div id="chatFeed"></div>
+    </div>
+  </aside>
+
+  <!-- map -->
+  <div class="map-wrap">
+    <div id="map"></div>
+    <!-- stats overlay -->
+    <div class="map-stats">
+      <div class="map-stats-title">INCIDENT STATS</div>
+      <div class="stat-row">
+        <span class="stat-label">Online</span>
+        <span class="stat-val" id="statOnline">0</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Located</span>
+        <span class="stat-val" id="statLocated">0</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">SOS Active</span>
+        <span class="stat-val sos-val" id="statSos">0</span>
+      </div>
+    </div>
+  </div>
+</main>
+
+<!-- ═══ CONNECT OVERLAY ══════════════════════════════════════════════ -->
+<div id="connectOverlay">
+  <div class="connect-card">
+    <div class="connect-logo"><span class="connect-logo-icon">▲ </span>FIRELINE</div>
+    <div class="connect-sub">
+      Edge-first incident coordination for first responders.<br>
+      Connect to monitor an active incident in real time.
+    </div>
+    <div class="field">
+      <div class="field-label">INCIDENT ID</div>
+      <input type="text" id="inIncident" placeholder="e.g. DEMO-001" />
+    </div>
+    <div class="field">
+      <div class="field-label">VIEWER ID</div>
+      <input type="text" id="inViewer" placeholder="COMMAND" value="COMMAND" />
+    </div>
+    <div class="field">
+      <div class="field-label">EDGE SERVER URL</div>
+      <input type="text" id="inServer" placeholder="ws://localhost:3000" value="ws://localhost:3000" />
+    </div>
+    <button class="btn-connect" id="btnConnect">CONNECT TO INCIDENT</button>
+    <div class="connect-hint">
+      Start the edge server, then run one or more simulator instances.<br>
+      <code style="color:var(--orange)">cd edge-server &amp;&amp; npm run sim</code>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ SCRIPTS ══════════════════════════════════════════════════════ -->
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+// ═══════════════════════════════════════════════════════════════════
+//  FIRELINE COMMAND DASHBOARD
+// ═══════════════════════════════════════════════════════════════════
+
+const COLORS = [
+  '#4a9eff', '#00e87a', '#ff9500', '#c87cff',
+  '#00d4ff', '#ffea00', '#ff6b6b', '#80ff80',
+];
+
+// ─── State ──────────────────────────────────────────────────────────
+const state = {
+  incidentId: null,
+  viewerId: null,
+  responders: new Set(),
+  locations: new Map(),   // responderId → {lat,lng,accuracy,at}
+  sos: new Map(),         // responderId → {note,at}
+  msgCount: 0,
+  colorMap: new Map(),
+  colorIdx: 0,
+  locLogDebounce: new Map(), // responderId → lastLoggedAt
+};
+
+function colorFor(id) {
+  if (!state.colorMap.has(id)) {
+    state.colorMap.set(id, COLORS[state.colorIdx % COLORS.length]);
+    state.colorIdx++;
+  }
+  return state.colorMap.get(id);
+}
+
+// ─── Map ─────────────────────────────────────────────────────────────
+const map = L.map('map', { center: [37.8, -122.4], zoom: 11, zoomControl: false });
+L.control.zoom({ position: 'bottomright' }).addTo(map);
+L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
+  subdomains: 'abcd',
+  maxZoom: 20,
+}).addTo(map);
+
+const markers = new Map(); // responderId → L.Marker
+
+function markerIcon(id, hasSos) {
+  const color  = colorFor(id);
+  const border = hasSos ? '#ff3a3a' : color;
+  const bg     = hasSos ? 'rgba(255,58,58,0.18)' : (color + '22');
+  const pulse  = hasSos ? 'animation:pulse 0.7s infinite;' : '';
+  const initials = id.slice(0, 3).toUpperCase();
+  return L.divIcon({
+    className: '',
+    html: `
+      <style>@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}</style>
+      <div style="
+        width:36px;height:36px;
+        border-radius:50% 50% 50% 0;
+        transform:rotate(-45deg);
+        border:2px solid ${border};
+        background:${bg};
+        display:flex;align-items:center;justify-content:center;
+        box-shadow:0 0 12px ${border}99;
+        ${pulse}
+      ">
+        <span style="
+          transform:rotate(45deg);
+          font-family:'Courier New',monospace;
+          font-size:9px;font-weight:bold;
+          color:${border};
+          display:block;text-align:center;
+          max-width:28px;overflow:hidden;
+        ">${initials}</span>
+      </div>`,
+    iconSize:    [36, 36],
+    iconAnchor:  [18, 36],
+    popupAnchor: [0, -40],
+  });
+}
+
+function upsertMarker(id, lat, lng) {
+  const icon = markerIcon(id, state.sos.has(id));
+  if (markers.has(id)) {
+    markers.get(id).setLatLng([lat, lng]).setIcon(icon);
+  } else {
+    const m = L.marker([lat, lng], { icon })
+      .addTo(map)
+      .bindPopup(`<b style="color:#ff9500">${id}</b>`);
+    markers.set(id, m);
+  }
+}
+
+function removeMarker(id) {
+  if (markers.has(id)) { map.removeLayer(markers.get(id)); markers.delete(id); }
+}
+
+function fitMap() {
+  if (markers.size === 0) return;
+  const pts = [...markers.values()].map(m => m.getLatLng());
+  if (pts.length === 1) { map.setView(pts[0], 14); }
+  else { map.fitBounds(L.latLngBounds(pts), { padding: [60, 60] }); }
+}
+
+// ─── Status bar ─────────────────────────────────────────────────────
+function setStatus(s) {
+  const dot   = document.getElementById('statusDot');
+  const label = document.getElementById('statusLabel');
+  dot.className   = `status-dot ${s}`;
+  label.className = `status-label ${s}`;
+  label.textContent = { connected: 'CONNECTED', connecting: 'CONNECTING…', disconnected: 'DISCONNECTED' }[s] || s.toUpperCase();
+}
+
+// ─── Responder list ─────────────────────────────────────────────────
+function renderResponders() {
+  const list = document.getElementById('responderList');
+  const badge = document.getElementById('badgeResponders');
+  badge.textContent = state.responders.size;
+  document.getElementById('statOnline').textContent = state.responders.size;
+
+  list.innerHTML = '';
+  for (const id of state.responders) {
+    const color  = colorFor(id);
+    const hasSos = state.sos.has(id);
+    const hasGps = state.locations.has(id);
+    const div    = document.createElement('div');
+    div.className = 'resp-item';
+    div.innerHTML = `
+      <div class="resp-dot online" style="background:${color};box-shadow:0 0 5px ${color}"></div>
+      <div class="resp-id">${id}</div>
+      ${hasSos ? '<span class="tag tag-sos">SOS</span>' : ''}
+      ${hasGps ? '<span class="tag tag-gps">GPS</span>' : ''}
+    `;
+    list.appendChild(div);
+  }
+}
+
+// ─── SOS banner ─────────────────────────────────────────────────────
+function renderSos() {
+  const banner = document.getElementById('sosBanner');
+  const list   = document.getElementById('sosList');
+  document.getElementById('statSos').textContent = state.sos.size;
+
+  if (state.sos.size === 0) { banner.classList.remove('active'); return; }
+  banner.classList.add('active');
+  list.innerHTML = '';
+  for (const [id, sos] of state.sos) {
+    const div = document.createElement('div');
+    div.className = 'sos-item';
+    div.innerHTML = `
+      <span class="sos-item-id">⚠ ${id}</span>
+      ${sos.note ? `<span class="sos-item-note">"${sos.note}"</span>` : ''}
+      <span class="sos-item-age">${timeAgo(sos.at)}</span>
+    `;
+    list.appendChild(div);
+  }
+}
+
+// ─── Chat feed ──────────────────────────────────────────────────────
+function log(html, cls = '') {
+  const feed = document.getElementById('chatFeed');
+  const div  = document.createElement('div');
+  div.className = `msg ${cls}`.trim();
+  div.innerHTML  = html;
+  feed.appendChild(div);
+  feed.scrollTop = feed.scrollHeight;
+  state.msgCount++;
+  document.getElementById('badgeMsgs').textContent = state.msgCount;
+}
+
+function ts(at) {
+  return `<span class="msg-time">[${new Date(at).toLocaleTimeString('en-US', { hour12: false })}]</span> `;
+}
+
+// ─── Helpers ────────────────────────────────────────────────────────
+function timeAgo(at) {
+  const s = Math.floor((Date.now() - at) / 1000);
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  return `${Math.floor(s / 3600)}h ago`;
+}
+
+// ─── WebSocket / message handling ───────────────────────────────────
+let ws = null;
+
+function connect(incidentId, viewerId, serverUrl) {
+  if (ws) ws.close();
+  state.incidentId = incidentId;
+  state.viewerId   = viewerId;
+  document.getElementById('hIncident').textContent = incidentId;
+  document.getElementById('hViewer').textContent   = viewerId;
+  setStatus('connecting');
+
+  ws = new WebSocket(serverUrl);
+
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ type: 'CLIENT_HELLO', incidentId, responderId: viewerId }));
+  };
+
+  ws.onmessage = ({ data }) => {
+    let msg; try { msg = JSON.parse(data); } catch { return; }
+    handle(msg);
+  };
+
+  ws.onclose = () => {
+    setStatus('disconnected');
+    log(ts(Date.now()) + '⚡ Connection closed.', 'msg-system');
+  };
+
+  ws.onerror = () => {
+    log(ts(Date.now()) + `<span style="color:var(--red)">✕ WebSocket error — is the edge server running?</span>`, 'msg-system');
+  };
+}
+
+function handle(msg) {
+  switch (msg.type) {
+
+    case 'ACK': {
+      setStatus('connected');
+      document.getElementById('connectOverlay').style.display = 'none';
+      log(ts(msg.at) + `✓ Joined incident <b style="color:var(--orange)">${msg.incidentId}</b>`, 'msg-system');
+      break;
+    }
+
+    case 'INCIDENT_SNAPSHOT': {
+      state.responders.clear();
+      state.locations.clear();
+      state.sos.clear();
+
+      for (const id of (msg.responders || [])) {
+        if (id !== state.viewerId) state.responders.add(id);
+      }
+      for (const [id, loc] of Object.entries(msg.locations || {})) {
+        state.locations.set(id, loc);
+        upsertMarker(id, loc.lat, loc.lng);
+      }
+      for (const [id, sos] of Object.entries(msg.sos || {})) {
+        state.sos.set(id, sos);
+      }
+
+      renderResponders();
+      renderSos();
+      document.getElementById('statLocated').textContent = state.locations.size;
+      if (markers.size > 0) fitMap();
+
+      const n = state.responders.size;
+      log(ts(msg.at) + `📡 Snapshot — <b>${n}</b> responder${n !== 1 ? 's' : ''} online`, 'msg-system');
+      break;
+    }
+
+    case 'PRESENCE_JOIN': {
+      if (msg.responderId === state.viewerId) break;
+      state.responders.add(msg.responderId);
+      renderResponders();
+      const c = colorFor(msg.responderId);
+      log(ts(msg.at) + `→ <b style="color:${c}">${msg.responderId}</b> joined`, 'msg-system');
+      break;
+    }
+
+    case 'PRESENCE_LEAVE': {
+      state.responders.delete(msg.responderId);
+      state.locations.delete(msg.responderId);
+      removeMarker(msg.responderId);
+      renderResponders();
+      document.getElementById('statLocated').textContent = state.locations.size;
+      log(ts(msg.at) + `← <span style="color:var(--text-dim)">${msg.responderId} left</span>`, 'msg-system');
+      break;
+    }
+
+    case 'LOCATION_UPDATE': {
+      state.locations.set(msg.responderId, { lat: msg.lat, lng: msg.lng, accuracy: msg.accuracy, at: msg.at });
+      upsertMarker(msg.responderId, msg.lat, msg.lng);
+      renderResponders();
+      document.getElementById('statLocated').textContent = state.locations.size;
+
+      // Debounce location logs (once per 10s per responder)
+      const last = state.locLogDebounce.get(msg.responderId) || 0;
+      if (Date.now() - last > 10000) {
+        state.locLogDebounce.set(msg.responderId, Date.now());
+        const c = colorFor(msg.responderId);
+        log(ts(msg.at) + `📍 <b style="color:${c}">${msg.responderId}</b> location updated`, 'msg-system');
+      }
+      break;
+    }
+
+    case 'SOS_RAISE': {
+      state.sos.set(msg.responderId, { note: msg.note, at: msg.at });
+      // Refresh marker to show SOS state
+      const loc = state.locations.get(msg.responderId);
+      if (loc) upsertMarker(msg.responderId, loc.lat, loc.lng);
+      renderResponders();
+      renderSos();
+      log(ts(msg.at) + `🚨 <b style="color:var(--red)">SOS — ${msg.responderId}</b>${msg.note ? `: "${msg.note}"` : ''}`, 'msg-sos');
+      break;
+    }
+
+    case 'SOS_CLEAR': {
+      state.sos.delete(msg.responderId);
+      const loc2 = state.locations.get(msg.responderId);
+      if (loc2) upsertMarker(msg.responderId, loc2.lat, loc2.lng);
+      renderResponders();
+      renderSos();
+      log(ts(msg.at) + `<span style="color:var(--green)">✓ SOS cleared — ${msg.responderId}</span>`, 'msg-system');
+      break;
+    }
+
+    case 'CHAT_SEND': {
+      const c = colorFor(msg.from);
+      log(ts(msg.at) + `<b style="color:${c}">${msg.from}</b>: ${msg.text}`);
+      break;
+    }
+  }
+}
+
+// ─── Connect panel ───────────────────────────────────────────────────
+document.getElementById('btnConnect').addEventListener('click', () => {
+  const incidentId = document.getElementById('inIncident').value.trim();
+  const viewerId   = (document.getElementById('inViewer').value.trim())   || 'COMMAND';
+  const serverUrl  = (document.getElementById('inServer').value.trim())   || 'ws://localhost:3000';
+  if (!incidentId) { document.getElementById('inIncident').focus(); return; }
+  connect(incidentId, viewerId, serverUrl);
+});
+
+['inIncident', 'inViewer', 'inServer'].forEach(id => {
+  document.getElementById(id).addEventListener('keydown', e => {
+    if (e.key === 'Enter') document.getElementById('btnConnect').click();
+  });
+});
+
+// ─── Refresh SOS ages every 30s ─────────────────────────────────────
+setInterval(() => { if (state.sos.size > 0) renderSos(); }, 30000);
+</script>
+</body>
+</html>
